@@ -1,18 +1,26 @@
 import torch
 from halo.meta_grads import compute_meta_grads
+from halo.optimizer import _build_phi_init, _horner
 
 
-def _make_intermediates(shape=(20,), device="cpu"):
+def _make_intermediates(shape=(20,), device="cpu", degree=1):
     """Create a fake intermediates dict plus the g_t and phi arguments."""
     g = torch.randn(shape, device=device)
     m = torch.randn(shape, device=device)
     v = torch.rand(shape, device=device) + 0.1
-    phi = torch.tensor([0.0, 1.4, 0.0, -0.4, 0.0, -2.0], device=device)
+    phi = _build_phi_init(degree).to(device=device)
+    # Give the slope/higher-order coefficients small nonzero values for testing
+    phi = phi + 0.1 * torch.randn_like(phi)
     rho = torch.tensor(0.3, device=device)
 
-    pm = torch.sigmoid(phi[0] * rho + phi[1])
-    pv = 0.5 * torch.sigmoid(phi[2] * rho + phi[3])
-    ps = torch.sigmoid(phi[4] * rho + phi[5])
+    n_phi = degree + 1
+    coeffs_m = phi[:n_phi]
+    coeffs_v = phi[n_phi : 2 * n_phi]
+    coeffs_s = phi[2 * n_phi :]
+
+    pm = torch.sigmoid(_horner(coeffs_m, rho))
+    pv = 0.5 * torch.sigmoid(_horner(coeffs_v, rho))
+    ps = torch.sigmoid(_horner(coeffs_s, rho))
 
     n = pm * m + (1 - pm) * g
     v_hat = v
@@ -30,11 +38,23 @@ def _make_intermediates(shape=(20,), device="cpu"):
 
 
 class TestMetaGradientShape:
-    def test_returns_correct_shape(self):
-        intermediates, g_t, phi = _make_intermediates()
+    def test_returns_correct_shape_degree1(self):
+        intermediates, g_t, phi = _make_intermediates(degree=1)
         g_next = torch.randn(20)
-        result = compute_meta_grads(g_next, intermediates, g_t, phi, eta=1e-3)
+        result = compute_meta_grads(g_next, intermediates, g_t, phi, eta=1e-3, degree=1)
         assert result.shape == (6,)
+
+    def test_returns_correct_shape_degree2(self):
+        intermediates, g_t, phi = _make_intermediates(degree=2)
+        g_next = torch.randn(20)
+        result = compute_meta_grads(g_next, intermediates, g_t, phi, eta=1e-3, degree=2)
+        assert result.shape == (9,)
+
+    def test_returns_correct_shape_degree3(self):
+        intermediates, g_t, phi = _make_intermediates(degree=3)
+        g_next = torch.randn(20)
+        result = compute_meta_grads(g_next, intermediates, g_t, phi, eta=1e-3, degree=3)
+        assert result.shape == (12,)
 
     def test_returns_scalar_values(self):
         intermediates, g_t, phi = _make_intermediates()
@@ -47,8 +67,16 @@ class TestMetaGradientShape:
 class TestFiniteDifference:
     """Verify analytic meta-gradients against numerical finite differences."""
 
+    def _compute_d(self, intermediates, eta):
+        n = intermediates["n_t"]
+        v_hat = intermediates["v_hat"]
+        ps = intermediates["p_s"]
+        pv = intermediates["p_v"]
+        n_abs = torch.clamp(n.abs(), min=1e-12)
+        denom = v_hat.pow(pv) + 1e-8
+        return -eta * n_abs.pow(1 - ps) * torch.sign(n) / denom
+
     def _numerical_dd_dpm(self, intermediates, g_t, g_next, eta, eps=1e-5):
-        """Numerical approximation of dL/dp_m via finite differences."""
         d_t = self._compute_d(intermediates, eta)
         loss_ref = torch.sum(g_next * d_t)
 
@@ -85,15 +113,6 @@ class TestFiniteDifference:
         intermediates["p_s"] = ps_orig
 
         return (loss_plus - loss_ref) / eps
-
-    def _compute_d(self, intermediates, eta):
-        n = intermediates["n_t"]
-        v_hat = intermediates["v_hat"]
-        ps = intermediates["p_s"]
-        pv = intermediates["p_v"]
-        n_abs = torch.clamp(n.abs(), min=1e-12)
-        denom = v_hat.pow(pv) + 1e-8
-        return -eta * n_abs.pow(1 - ps) * torch.sign(n) / denom
 
     def test_dd_dpm_matches_finite_diff(self):
         torch.manual_seed(42)
@@ -146,6 +165,90 @@ class TestFiniteDifference:
             f"dd_dps: analytical={analytical:.6f}, numerical={numerical:.6f}"
         )
 
+    def test_full_meta_grad_finite_diff_degree1(self):
+        """End-to-end finite-diff check: perturb each phi element."""
+        torch.manual_seed(42)
+        intermediates_orig, g_t, phi = _make_intermediates(degree=1)
+        g_next = torch.randn(20)
+        eta = 1e-3
+
+        analytical = compute_meta_grads(g_next, intermediates_orig, g_t, phi, eta, degree=1)
+
+        eps = 1e-5
+        for idx in range(phi.shape[0]):
+            phi_plus = phi.clone()
+            phi_plus[idx] += eps
+
+            inter_plus = _rebuild_intermediates(phi_plus, intermediates_orig, g_t, degree=1)
+            d_plus = self._compute_d(inter_plus, eta)
+
+            phi_minus = phi.clone()
+            phi_minus[idx] -= eps
+
+            inter_minus = _rebuild_intermediates(phi_minus, intermediates_orig, g_t, degree=1)
+            d_minus = self._compute_d(inter_minus, eta)
+
+            numerical = torch.sum(g_next * (d_plus - d_minus)) / (2 * eps)
+            assert torch.isclose(analytical[idx], numerical, atol=1e-3, rtol=5e-2), (
+                f"phi[{idx}]: analytical={analytical[idx]:.6f}, numerical={numerical:.6f}"
+            )
+
+    def test_full_meta_grad_finite_diff_degree2(self):
+        """End-to-end finite-diff check for degree-2 polynomial."""
+        torch.manual_seed(42)
+        intermediates_orig, g_t, phi = _make_intermediates(degree=2)
+        g_next = torch.randn(20)
+        eta = 1e-3
+
+        analytical = compute_meta_grads(g_next, intermediates_orig, g_t, phi, eta, degree=2)
+
+        eps = 1e-5
+        for idx in range(phi.shape[0]):
+            phi_plus = phi.clone()
+            phi_plus[idx] += eps
+
+            inter_plus = _rebuild_intermediates(phi_plus, intermediates_orig, g_t, degree=2)
+            d_plus = self._compute_d(inter_plus, eta)
+
+            phi_minus = phi.clone()
+            phi_minus[idx] -= eps
+
+            inter_minus = _rebuild_intermediates(phi_minus, intermediates_orig, g_t, degree=2)
+            d_minus = self._compute_d(inter_minus, eta)
+
+            numerical = torch.sum(g_next * (d_plus - d_minus)) / (2 * eps)
+            assert torch.isclose(analytical[idx], numerical, atol=1e-3, rtol=5e-2), (
+                f"phi[{idx}]: analytical={analytical[idx]:.6f}, numerical={numerical:.6f}"
+            )
+
+
+def _rebuild_intermediates(phi, orig_intermediates, g_t, degree):
+    """Rebuild intermediates from a perturbed phi (for finite-diff testing)."""
+    rho = orig_intermediates["rho"]
+    m_hat = orig_intermediates["m_hat"]
+    v_hat = orig_intermediates["v_hat"]
+
+    n_phi = degree + 1
+    coeffs_m = phi[:n_phi]
+    coeffs_v = phi[n_phi : 2 * n_phi]
+    coeffs_s = phi[2 * n_phi :]
+
+    pm = torch.sigmoid(_horner(coeffs_m, rho))
+    pv = 0.5 * torch.sigmoid(_horner(coeffs_v, rho))
+    ps = torch.sigmoid(_horner(coeffs_s, rho))
+
+    n_t = pm * m_hat + (1 - pm) * g_t
+
+    return {
+        "n_t": n_t,
+        "m_hat": m_hat,
+        "v_hat": v_hat,
+        "p_m": pm,
+        "p_v": pv,
+        "p_s": ps,
+        "rho": rho,
+    }
+
 
 class TestEdgeCases:
     def test_zero_gradient(self):
@@ -175,6 +278,14 @@ class TestEdgeCases:
         g_next = torch.randn(20)
         result = compute_meta_grads(g_next, intermediates, g_t, phi, eta=1e-3)
         assert not torch.any(torch.isnan(result))
+
+    def test_extreme_rho_degree2(self):
+        intermediates, g_t, phi = _make_intermediates(degree=2)
+        intermediates["rho"] = torch.tensor(0.99)
+        g_next = torch.randn(20)
+        result = compute_meta_grads(g_next, intermediates, g_t, phi, eta=1e-3, degree=2)
+        assert not torch.any(torch.isnan(result))
+        assert not torch.any(torch.isinf(result))
 
     def test_device_consistency(self):
         if torch.backends.mps.is_available():

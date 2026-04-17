@@ -26,6 +26,7 @@ class TestInstantiation:
         assert opt.defaults["weight_decay"] == 0.01
         assert opt.defaults["gamma"] == 0.99
         assert opt.defaults["eta_phi"] == 0.01
+        assert opt.defaults["degree"] == 1
         assert opt.diagnostics is None
 
     def test_diagnostics_enabled(self):
@@ -47,6 +48,36 @@ class TestInstantiation:
         p = torch.zeros(10, requires_grad=True)
         with pytest.raises(ValueError):
             HALO([p], gamma=1.5)
+
+    def test_invalid_degree_zero(self):
+        p = torch.zeros(10, requires_grad=True)
+        with pytest.raises(ValueError):
+            HALO([p], degree=0)
+
+    def test_invalid_degree_float(self):
+        p = torch.zeros(10, requires_grad=True)
+        with pytest.raises(ValueError):
+            HALO([p], degree=1.5)
+
+    def test_invalid_degree_negative(self):
+        p = torch.zeros(10, requires_grad=True)
+        with pytest.raises(ValueError):
+            HALO([p], degree=-1)
+
+    def test_phi_size_degree1(self):
+        p = torch.zeros(10, requires_grad=True)
+        opt = HALO([p], degree=1)
+        assert opt.param_groups[0]["phi"].shape == (6,)
+
+    def test_phi_size_degree2(self):
+        p = torch.zeros(10, requires_grad=True)
+        opt = HALO([p], degree=2)
+        assert opt.param_groups[0]["phi"].shape == (9,)
+
+    def test_phi_size_degree3(self):
+        p = torch.zeros(10, requires_grad=True)
+        opt = HALO([p], degree=3)
+        assert opt.param_groups[0]["phi"].shape == (12,)
 
 
 class TestBasicStep:
@@ -106,6 +137,7 @@ class TestBasicStep:
         assert all(len(v) == 5 for v in history.values())
         assert "p_m" in history
         assert "rho" in history
+        assert "phi_0" in history
 
     def test_no_diagnostics_no_overhead(self):
         W, x, target = _make_quadratic_problem()
@@ -166,5 +198,92 @@ class TestResponsePolicy:
         ps = torch.sigmoid(a3 * rho + b3)
 
         assert 0.7 < pm < 0.9
-        assert 0.1 < pv < 0.4
+        assert 0.4 < pv < 0.5
         assert 0.05 < ps < 0.2
+
+    def test_rho_near_zero_policy_degree2(self):
+        """Higher-degree phi with zero higher-order coeffs gives same result."""
+        p = torch.randn(10, requires_grad=True)
+        opt = HALO([p], lr=1e-3, degree=2)
+        phi = opt.param_groups[0]["phi"]
+        rho = torch.tensor(0.0)
+
+        n = 3  # degree + 1
+        from halo.optimizer import _horner
+        pm = torch.sigmoid(_horner(phi[:n], rho))
+        pv = 0.5 * torch.sigmoid(_horner(phi[n : 2 * n], rho))
+        ps = torch.sigmoid(_horner(phi[2 * n :], rho))
+
+        assert 0.7 < pm < 0.9
+        assert 0.4 < pv < 0.5
+        assert 0.05 < ps < 0.2
+
+
+class TestPolynomialDegree:
+    def test_degree2_converges(self):
+        """Degree-2 optimizer should still converge on the quadratic problem."""
+        W, x, target = _make_quadratic_problem()
+        opt = HALO([W], lr=0.1, degree=2)
+        loss0 = _forward(W, x, target)
+
+        for _ in range(100):
+            opt.zero_grad()
+            loss = _forward(W, x, target)
+            loss.backward()
+            opt.step()
+
+        final_loss = _forward(W, x, target)
+        assert final_loss < loss0 * 0.1
+
+    def test_degree3_converges(self):
+        W, x, target = _make_quadratic_problem()
+        opt = HALO([W], lr=0.1, degree=3)
+        loss0 = _forward(W, x, target)
+
+        for _ in range(100):
+            opt.zero_grad()
+            loss = _forward(W, x, target)
+            loss.backward()
+            opt.step()
+
+        final_loss = _forward(W, x, target)
+        assert final_loss < loss0 * 0.1
+
+    def test_degree2_phi_updates(self):
+        W, x, target = _make_quadratic_problem()
+        opt = HALO([W], lr=0.1, eta_phi=0.1, degree=2)
+
+        phi_init = opt.param_groups[0]["phi"].clone()
+
+        for _ in range(20):
+            opt.zero_grad()
+            loss = _forward(W, x, target)
+            loss.backward()
+            opt.step()
+
+        phi_final = opt.param_groups[0]["phi"]
+        assert not torch.allclose(phi_init, phi_final)
+
+    def test_degree2_diagnostics(self):
+        W, x, target = _make_quadratic_problem()
+        opt = HALO([W], lr=0.1, degree=2, diagnostics=True)
+
+        for _ in range(5):
+            opt.zero_grad()
+            loss = _forward(W, x, target)
+            loss.backward()
+            opt.step()
+
+        history = opt.diagnostics.get_history()
+        assert len(history["step"]) == 5
+        # degree=2 -> 9 phi params -> phi_0 through phi_8
+        for i in range(9):
+            assert f"phi_{i}" in history
+            assert len(history[f"phi_{i}"]) == 5
+
+    def test_degree1_backward_compatible_phi_init(self):
+        """Degree-1 phi_init should match the original hardcoded values."""
+        from halo.optimizer import _build_phi_init
+        phi = _build_phi_init(1)
+        expected = torch.tensor([0.0, 1.4, 0.0, 3.0, 0.0, -2.0])
+        assert torch.allclose(phi, expected)

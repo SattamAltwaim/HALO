@@ -1,7 +1,7 @@
 """
 HALO -- Homeostatic Adaptive Learning Optimizer.
 
-Adam with a 6-parameter brain that reads the loss landscape and reshapes
+Adam with a learnable brain that reads the loss landscape and reshapes
 the update rule every step. The brain is trained by gradient descent using
 information the optimizer already computes.
 """
@@ -13,8 +13,41 @@ from .diagnostics import DiagnosticsTracker
 from .meta_grads import compute_meta_grads
 
 
-PHI_INIT = torch.tensor([0.0, 1.4, 0.0, 3.0, 0.0, -2.0])
+# Degree-1 biases for the three policy sigmoids (slope=0, so flat at init).
+_PHI_BIAS = (1.4, 3.0, -2.0)
+
 META_GRAD_CLIP = 1.0  # safety cap on ||meta_grad_acc|| before phi update
+
+
+def _build_phi_init(degree: int) -> torch.Tensor:
+    """Build the initial phi vector for a given polynomial degree.
+
+    Layout: three consecutive blocks of (degree+1) coefficients, one per
+    policy variable (pm, pv, ps). Within each block the coefficients are
+    ordered highest-power-first: [coeff_d, ..., coeff_1, coeff_0].
+
+    Higher-order coefficients start at zero; the degree-1 (slope) coefficient
+    is zero; the degree-0 (bias) coefficient gets the Adam-like default.
+    This makes the initial behavior identical regardless of degree.
+    """
+    n = degree + 1
+    phi = torch.zeros(3 * n)
+    for i, bias in enumerate(_PHI_BIAS):
+        phi[i * n + n - 1] = bias  # constant term (last in block)
+    return phi
+
+
+def _horner(coeffs: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Evaluate a polynomial using Horner's method.
+
+    coeffs: 1-D tensor [c_d, c_{d-1}, ..., c_1, c_0] (highest power first).
+    x: scalar tensor.
+    Returns: scalar tensor = c_d*x^d + ... + c_1*x + c_0.
+    """
+    out = coeffs[0]
+    for k in range(1, coeffs.shape[0]):
+        out = out * x + coeffs[k]
+    return out
 
 
 class HALO(Optimizer):
@@ -28,6 +61,7 @@ class HALO(Optimizer):
         weight_decay: weight decay coefficient (default: 0.01).
         gamma: smoothing factor for the landscape signal (default: 0.99).
         eta_phi: meta learning rate for the response policy (default: 0.01).
+        degree: polynomial degree for the response policy (default: 1).
         diagnostics: if True, record internal state every step (default: False).
     """
 
@@ -40,6 +74,7 @@ class HALO(Optimizer):
         weight_decay=0.01,
         gamma=0.99,
         eta_phi=0.01,
+        degree=1,
         diagnostics=False,
     ):
         if not 0.0 <= lr:
@@ -52,6 +87,8 @@ class HALO(Optimizer):
             raise ValueError(f"Invalid eps: {eps}")
         if not 0.0 <= gamma < 1.0:
             raise ValueError(f"Invalid gamma: {gamma}")
+        if not (isinstance(degree, int) and degree >= 1):
+            raise ValueError(f"Invalid degree: {degree} (must be int >= 1)")
 
         defaults = dict(
             lr=lr,
@@ -60,17 +97,22 @@ class HALO(Optimizer):
             weight_decay=weight_decay,
             gamma=gamma,
             eta_phi=eta_phi,
+            degree=degree,
         )
         super().__init__(params, defaults)
 
-        self.diagnostics = DiagnosticsTracker() if diagnostics else None
+        self.diagnostics = (
+            DiagnosticsTracker(degree=degree) if diagnostics else None
+        )
+
+        phi_init = _build_phi_init(degree)
 
         # Initialize phi and rho per group. rho is a 0-dim tensor on the
         # first param's device to avoid GPU->CPU syncs in the hot path.
         for group in self.param_groups:
             device = next(iter(group["params"])).device
             group["rho"] = torch.zeros((), device=device)
-            group["phi"] = PHI_INIT.clone().to(device=device)
+            group["phi"] = phi_init.clone().to(device=device)
             group["step"] = 0
 
     @torch.no_grad()
@@ -128,13 +170,22 @@ class HALO(Optimizer):
             rho = gamma * rho + (1 - gamma) * r
 
             # ---- Single response policy for the whole group ----
-            a1, b1, a2, b2, a3, b3 = phi.unbind()
-            pm = torch.sigmoid(a1 * rho + b1)
-            pv = 0.5 * torch.sigmoid(a2 * rho + b2)
-            ps = torch.sigmoid(a3 * rho + b3)
+            degree = group["degree"]
+            n_phi = degree + 1
+            coeffs_m = phi[:n_phi]
+            coeffs_v = phi[n_phi : 2 * n_phi]
+            coeffs_s = phi[2 * n_phi :]
+
+            z_m = _horner(coeffs_m, rho)
+            z_v = _horner(coeffs_v, rho)
+            z_s = _horner(coeffs_s, rho)
+
+            pm = torch.sigmoid(z_m)
+            pv = 0.5 * torch.sigmoid(z_v)
+            ps = torch.sigmoid(z_s)
 
             # ---- Pass 2: meta-gradient + Adam update for each param ----
-            meta_grad_acc = torch.zeros(6, device=phi.device)
+            meta_grad_acc = torch.zeros(3 * n_phi, device=phi.device)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -149,7 +200,9 @@ class HALO(Optimizer):
                 # Meta-gradient from step t (intermediates) against g_{t+1} (current g).
                 intermediates = state.get("intermediates")
                 if intermediates is not None:
-                    mg = compute_meta_grads(g, intermediates, g_prev, phi, lr)
+                    mg = compute_meta_grads(
+                        g, intermediates, g_prev, phi, lr, degree=degree
+                    )
                     meta_grad_acc += mg.to(phi.device)
 
                 # Adam bookkeeping
