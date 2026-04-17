@@ -8,21 +8,20 @@ Only records data when explicitly enabled. Zero overhead when disabled.
 class DiagnosticsTracker:
     """Stores per-step optimizer internals for analysis."""
 
-    def __init__(self):
+    def __init__(self, *, degree: int = 1):
+        self._degree = degree
+        n_phi = 3 * (degree + 1)
+        self._phi_keys = [f"phi_{i}" for i in range(n_phi)]
         self._history = {
+            "step": [],
             "r": [],
             "rho": [],
             "p_m": [],
             "p_v": [],
             "p_s": [],
-            "a1": [],
-            "b1": [],
-            "a2": [],
-            "b2": [],
-            "a3": [],
-            "b3": [],
-            "step": [],
         }
+        for key in self._phi_keys:
+            self._history[key] = []
 
     def record(self, step, r, rho, pm, pv, ps, phi):
         """Record diagnostics for one step."""
@@ -33,7 +32,7 @@ class DiagnosticsTracker:
         self._history["p_v"].append(float(pv))
         self._history["p_s"].append(float(ps))
         phi_vals = phi.detach().cpu().tolist()
-        for i, key in enumerate(["a1", "b1", "a2", "b2", "a3", "b3"]):
+        for i, key in enumerate(self._phi_keys):
             self._history[key].append(phi_vals[i])
 
     def get_history(self):
