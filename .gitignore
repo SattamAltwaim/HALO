@@ -12,4 +12,3 @@ data/
 .obsidian/
 *.md
 !README.md
-Experiments/*.ipynb
