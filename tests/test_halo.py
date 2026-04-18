@@ -67,17 +67,24 @@ class TestInstantiation:
     def test_phi_size_degree1(self):
         p = torch.zeros(10, requires_grad=True)
         opt = HALO([p], degree=1)
-        assert opt.param_groups[0]["phi"].shape == (6,)
+        # phi is lazily created in state on first step
+        p.grad = torch.randn(10)
+        opt.step()
+        assert opt.state[p]["phi"].shape == (6,)
 
     def test_phi_size_degree2(self):
         p = torch.zeros(10, requires_grad=True)
         opt = HALO([p], degree=2)
-        assert opt.param_groups[0]["phi"].shape == (9,)
+        p.grad = torch.randn(10)
+        opt.step()
+        assert opt.state[p]["phi"].shape == (9,)
 
     def test_phi_size_degree3(self):
         p = torch.zeros(10, requires_grad=True)
         opt = HALO([p], degree=3)
-        assert opt.param_groups[0]["phi"].shape == (12,)
+        p.grad = torch.randn(10)
+        opt.step()
+        assert opt.state[p]["phi"].shape == (12,)
 
 
 class TestBasicStep:
@@ -111,15 +118,19 @@ class TestBasicStep:
         W, x, target = _make_quadratic_problem()
         opt = HALO([W], lr=0.1, eta_phi=0.1, diagnostics=True)
 
-        phi_init = opt.param_groups[0]["phi"].clone()
+        # Run one step to lazily init phi
+        opt.zero_grad()
+        _forward(W, x, target).backward()
+        opt.step()
+        phi_init = opt.state[W]["phi"].clone()
 
-        for _ in range(20):
+        for _ in range(19):
             opt.zero_grad()
             loss = _forward(W, x, target)
             loss.backward()
             opt.step()
 
-        phi_final = opt.param_groups[0]["phi"]
+        phi_final = opt.state[W]["phi"]
         assert not torch.allclose(phi_init, phi_final)
 
     def test_diagnostics_records(self):
@@ -133,11 +144,13 @@ class TestBasicStep:
             opt.step()
 
         history = opt.diagnostics.get_history()
-        assert len(history["step"]) == 5
-        assert all(len(v) == 5 for v in history.values())
-        assert "p_m" in history
-        assert "rho" in history
-        assert "phi_0" in history
+        assert len(history["steps"]) == 5
+        pnames = list(history["params"].keys())
+        assert len(pnames) == 1
+        entry = history["params"][pnames[0]]
+        assert len(entry["p_m"]) == 5
+        assert len(entry["rho"]) == 5
+        assert "phi_0" in entry
 
     def test_no_diagnostics_no_overhead(self):
         W, x, target = _make_quadratic_problem()
@@ -188,7 +201,10 @@ class TestResponsePolicy:
         """At rho=0, policy should produce near-Adam defaults."""
         p = torch.randn(10, requires_grad=True)
         opt = HALO([p], lr=1e-3)
-        phi = opt.param_groups[0]["phi"]
+        # Trigger lazy init
+        p.grad = torch.randn(10)
+        opt.step()
+        phi = opt.state[p]["phi"]
 
         a1, b1, a2, b2, a3, b3 = phi.unbind()
         rho = torch.tensor(0.0)
@@ -205,7 +221,9 @@ class TestResponsePolicy:
         """Higher-degree phi with zero higher-order coeffs gives same result."""
         p = torch.randn(10, requires_grad=True)
         opt = HALO([p], lr=1e-3, degree=2)
-        phi = opt.param_groups[0]["phi"]
+        p.grad = torch.randn(10)
+        opt.step()
+        phi = opt.state[p]["phi"]
         rho = torch.tensor(0.0)
 
         n = 3  # degree + 1
@@ -253,15 +271,18 @@ class TestPolynomialDegree:
         W, x, target = _make_quadratic_problem()
         opt = HALO([W], lr=0.1, eta_phi=0.1, degree=2)
 
-        phi_init = opt.param_groups[0]["phi"].clone()
+        opt.zero_grad()
+        _forward(W, x, target).backward()
+        opt.step()
+        phi_init = opt.state[W]["phi"].clone()
 
-        for _ in range(20):
+        for _ in range(19):
             opt.zero_grad()
             loss = _forward(W, x, target)
             loss.backward()
             opt.step()
 
-        phi_final = opt.param_groups[0]["phi"]
+        phi_final = opt.state[W]["phi"]
         assert not torch.allclose(phi_init, phi_final)
 
     def test_degree2_diagnostics(self):
@@ -275,11 +296,13 @@ class TestPolynomialDegree:
             opt.step()
 
         history = opt.diagnostics.get_history()
-        assert len(history["step"]) == 5
-        # degree=2 -> 9 phi params -> phi_0 through phi_8
+        assert len(history["steps"]) == 5
+        pnames = list(history["params"].keys())
+        assert len(pnames) == 1
+        entry = history["params"][pnames[0]]
         for i in range(9):
-            assert f"phi_{i}" in history
-            assert len(history[f"phi_{i}"]) == 5
+            assert f"phi_{i}" in entry
+            assert len(entry[f"phi_{i}"]) == 5
 
     def test_degree1_backward_compatible_phi_init(self):
         """Degree-1 phi_init should match the original hardcoded values."""
@@ -287,3 +310,72 @@ class TestPolynomialDegree:
         phi = _build_phi_init(1)
         expected = torch.tensor([0.0, 1.4, 0.0, 3.0, 0.0, -2.0])
         assert torch.allclose(phi, expected)
+
+
+class TestPerParamPolicy:
+    """Tests specific to the per-parameter policy design."""
+
+    def test_each_param_has_own_phi(self):
+        W1 = torch.randn(5, 5, requires_grad=True)
+        W2 = torch.randn(5, 5, requires_grad=True)
+        opt = HALO([W1, W2], lr=0.1, eta_phi=0.1)
+
+        for _ in range(20):
+            opt.zero_grad()
+            loss = (W1.sum() + W2.pow(2).sum())
+            loss.backward()
+            opt.step()
+
+        phi1 = opt.state[W1]["phi"]
+        phi2 = opt.state[W2]["phi"]
+        assert phi1.shape == (6,)
+        assert phi2.shape == (6,)
+        assert not torch.allclose(phi1, phi2)
+
+    def test_each_param_has_own_rho(self):
+        W1 = torch.randn(5, 5, requires_grad=True)
+        W2 = torch.randn(5, 5, requires_grad=True)
+        opt = HALO([W1, W2], lr=0.1)
+
+        for _ in range(10):
+            opt.zero_grad()
+            loss = (W1.sum() + W2.pow(2).sum())
+            loss.backward()
+            opt.step()
+
+        rho1 = opt.state[W1]["rho"]
+        rho2 = opt.state[W2]["rho"]
+        assert rho1.shape == ()
+        assert rho2.shape == ()
+
+    def test_set_param_names(self):
+        import torch.nn as nn
+        model = nn.Linear(5, 3)
+        opt = HALO(model.parameters(), lr=0.1, diagnostics=True)
+        opt.set_param_names(model.named_parameters())
+
+        x = torch.randn(2, 5)
+        loss = model(x).sum()
+        loss.backward()
+        opt.step()
+
+        history = opt.diagnostics.get_history()
+        pnames = list(history["params"].keys())
+        assert "weight" in pnames
+        assert "bias" in pnames
+
+    def test_multi_param_diagnostics(self):
+        W1 = torch.randn(5, 5, requires_grad=True)
+        W2 = torch.randn(3, 3, requires_grad=True)
+        opt = HALO([W1, W2], lr=0.1, diagnostics=True)
+
+        for _ in range(5):
+            opt.zero_grad()
+            (W1.sum() + W2.sum()).backward()
+            opt.step()
+
+        history = opt.diagnostics.get_history()
+        assert len(history["steps"]) == 5
+        assert len(history["params"]) == 2
+        for entry in history["params"].values():
+            assert len(entry["p_m"]) == 5
